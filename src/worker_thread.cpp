@@ -8,30 +8,40 @@
 
 #include <utility>
 
-WorkerThread::WorkerThread(uint32_t index,
-                           const std::vector<WorkerThread*>& thread_pool)
+WorkerThread::WorkerThread(
+    size_t index, const std::vector<std::unique_ptr<WorkerThread>>& thread_pool)
     : thread_pool_(thread_pool), my_index_(index)
 {
 }
 
-bool WorkerThread::isFull() const { return (bottom_ & MASK) < (top_ & MASK); }
+bool WorkerThread::isFull() const { return (bottom_ - top_) >= 4096; }
 
 void WorkerThread::start(const std::stop_token& st)
 {
-    thread_ = std::jthread(&WorkerThread::run, this, st);
+    thread_ = std::jthread(&WorkerThread::run, this, std::move(st));
 }
 
-void WorkerThread::push(const Job& j)
+void WorkerThread::push(const Job j)
 {
+    // Spinlock acquisition (TAS)
+    while (queue_lock_.test_and_set(std::memory_order_acquire))
+    {
+#if defined(__x86_64__) || defined(_M_X64)
+        _mm_pause();
+#endif
+    }
+
+    // --- Critical Section ---
     size_t b = bottom_.load(std::memory_order_relaxed);
-
     queue_[b & MASK] = j;
-
-    std::atomic_thread_fence(std::memory_order_release);
-
     bottom_.store(b + 1, std::memory_order_release);
-}
+    // ------------------------
 
+    queue_lock_.clear(std::memory_order_release);
+
+    // Waking up a waiting run()
+    bottom_.notify_one();
+}
 void WorkerThread::run(std::stop_token st)
 {
     const size_t thread_pool_size = thread_pool_.size();
@@ -54,7 +64,7 @@ void WorkerThread::run(std::stop_token st)
             const uint32_t tgt_idx = getFastRandom() % thread_pool_size;
 
             if (tgt_idx == my_index_)
-                continue; // 내 번호는 스킵
+                continue; // Skip my number
 
             if (auto item = thread_pool_[tgt_idx]->popFront(); item.has_value())
             {
@@ -64,69 +74,105 @@ void WorkerThread::run(std::stop_token st)
                 break;
             }
         }
-        // 가져갈 것이 없으면 휴식
-        if (!stole_work)
-            std::this_thread::yield();
+
+        // break if nothing to take
+        if (stole_work)
+            continue;
+
+        // Take a note of the bottom value at the current point in time.
+        size_t snapshot_bottom = bottom_.load(std::memory_order_acquire);
+
+        // Immediately after taking the snapshot, compare it to TOP to see if
+        // the queue is truly empty.
+        size_t current_top = top_.load(std::memory_order_acquire);
+
+        if (current_top < snapshot_bottom)
+            continue;
+
+        bottom_.wait(snapshot_bottom);
     }
 }
 
 std::optional<Job> WorkerThread::popBack()
 {
+    std::optional<Job> result = std::nullopt;
+
+    // 락 획득
+    while (queue_lock_.test_and_set(std::memory_order_acquire))
+    {
+#if defined(__x86_64__) || defined(_M_X64)
+        _mm_pause();
+#endif
+    }
+
+    // --- Critical Section ---
     size_t b = bottom_.load(std::memory_order_relaxed) - 1;
-
     bottom_.store(b, std::memory_order_relaxed);
-    std::atomic_thread_fence(std::memory_order_seq_cst);
 
-    size_t t = top_.load(std::memory_order_acquire);
+    std::atomic_thread_fence(
+        std::memory_order_seq_cst); // Ensuring order with stealers
+
+    size_t t = top_.load(std::memory_order_relaxed);
 
     if (t <= b)
     {
-        Job job = queue_[b & MASK];
+        result = queue_[b & MASK];
 
-        // [위험구간] 잡이 딱 1개 남았었을 경우
+        // Compete with Stealer when the last 1 is left
         if (t == b)
         {
-            // Top이 여전히 t라면 -> t+1로 증가시키고 성공 (Compare-And-Swap)
-            // 실패했다면 -> 채간 것
             if (!top_.compare_exchange_strong(t, t + 1,
                                               std::memory_order_seq_cst,
                                               std::memory_order_relaxed))
             {
-                // 실패시 되돌려두고 nullopt 반환
+                // Failed: Stealer took over -> nullopt after revert
                 bottom_.store(b + 1, std::memory_order_relaxed);
-                return std::nullopt;
+                result = std::nullopt;
             }
-            // 성공시 작업 반환
-            return job;
+            else
+            {
+                // Success: Restore to My -> Empty state
+                bottom_.store(b + 1, std::memory_order_relaxed);
+            }
         }
-        return job;
     }
+    else
+    {
+        // Empty -> Reset
+        bottom_.store(b + 1, std::memory_order_relaxed);
+    }
+    // ------------------------
 
-    // 비어있으면 줄였던 bottom_ 복구 및 nullopt 반환
-    bottom_.store(b + 1, std::memory_order_relaxed);
-    return std::nullopt;
+    queue_lock_.clear(std::memory_order_release);
+    return result;
 }
 
 std::optional<Job> WorkerThread::popFront()
 {
     size_t t = top_.load(std::memory_order_acquire);
+
+    // Paired with fence in popBack,
+    // need to ensure the order of reading bottom after reading top.
     std::atomic_thread_fence(std::memory_order_seq_cst);
+
     size_t b = bottom_.load(std::memory_order_acquire);
 
     if (t < b)
     {
-        // 잡이 있어 보임
         Job job = queue_[t & MASK];
 
-        // 가져가기 시도
-        // Top을 t에서 t+1로 바꿀 수 있어야 성공
+        // Attempt to get item by incrementing top with CAS
+        // On success: top becomes t+1 (logically popped)
+        // On failure: Another thief took it, or the owner popped the last one
+        // with popBack, etc. Take.
         if (!top_.compare_exchange_strong(t, t + 1, std::memory_order_seq_cst,
                                           std::memory_order_relaxed))
         {
-            return std::nullopt; // 실패
+            return std::nullopt;
         }
 
         return job;
     }
-    return std::nullopt; // 비어있음
+
+    return std::nullopt;
 }

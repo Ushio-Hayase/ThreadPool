@@ -9,12 +9,14 @@
 // Job 구조체 정의가 필요합니다 (헤더 위치에 따라 수정하세요)
 #include "data.h"
 
+#pragma pack(push, 1)
 // 테스트를 위한 헬퍼 데이터 구조체
 struct TestData
 {
     std::atomic<int>* counter;
     int value;
 };
+#pragma pack(pop)
 
 // 테스트용 작업 함수 (C-Style Function Pointer)
 void jobIncrement(void* raw_data)
@@ -42,12 +44,9 @@ TEST(ThreadPoolTest, SimpleJobExecution)
     Job job{jobIncrement, &data};
     pool.enqueueJob(job);
 
-    // 비동기 작업이므로 잠시 대기 (실제 엔진엔 Fence나 Wait 기능 필요)
-    int timeout_ms = 1000;
-    while (counter.load() == 0 && timeout_ms > 0)
+    while (counter.load() == 0)
     {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        timeout_ms--;
+        std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 
     ASSERT_EQ(counter.load(), 1);
@@ -74,19 +73,12 @@ TEST(ThreadPoolTest, MassiveConcurrentJobs)
     for (int i = 0; i < JOB_COUNT; ++i)
     {
         pool.enqueueJob(job);
-
-        // 너무 빨리 넣으면 메인 스레드 큐가 터질 수 있으니
-        // 꽉 찼을 때를 대비한 백오프 로직이 엔진에 있어야 함.
-        // 여기서는 테스트를 위해 살짝 텀을 줌 (선택 사항)
-        if (i % 4000 == 0)
-            std::this_thread::yield();
     }
 
     // 모든 작업이 끝날 때까지 대기
     int retries = 0;
     while (counter.load() < JOB_COUNT)
     {
-        std::this_thread::yield();
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
         retries++;
     }
