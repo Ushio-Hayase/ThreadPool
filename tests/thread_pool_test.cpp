@@ -68,7 +68,7 @@ TEST(ThreadPoolTest, MassiveConcurrentJobs)
 
     // 큐 크기(4096)보다 훨씬 많은 작업을 투입하여
     // 인덱스 마스킹과 링 버퍼 회전이 정상 작동하는지 확인
-    const int JOB_COUNT = 100000;
+    const int JOB_COUNT = 1'00'000;
 
     for (int i = 0; i < JOB_COUNT; ++i)
     {
@@ -145,33 +145,66 @@ TEST(ThreadPoolTest, WorkStealingBalance)
 // Job 구조체나 Atomic 변수들이 캐시 라인을 침범하지 않는지 간접 확인
 TEST(ThreadPoolTest, CacheCoherency)
 {
-    // 서로 다른 데이터를 건드리는 수많은 작업을 동시에 수행하여
-    // 데이터 오염(Data Corruption)이 없는지 확인
+    // 1. 설정
     const int NUM_THREADS = 8;
-    ThreadPool pool(NUM_THREADS);
+    const int JOBS_PER_THREAD = 100;     // 인덱스당 투입할 작업 수
+    const int INCREMENTS_PER_JOB = 1000; // 작업당 증가 횟수
+    const int TARGET_COUNT =
+        JOBS_PER_THREAD * INCREMENTS_PER_JOB; // 목표: 100,000
 
+    // 2. 데이터 정의 (False Sharing 방지 패딩 포함)
     struct PaddingData
     {
-        char pad[64]; // 캐시 라인 분리
-        int id;
         std::atomic<int> count{0};
+        char pad[64 - sizeof(std::atomic<int>)]; // 캐시 라인(64바이트) 채우기
     };
 
+    // atomic은 복사가 불가능하므로, vector가 재할당되지 않도록 미리 공간 확보
     std::vector<PaddingData> inputs(NUM_THREADS);
 
+    // 3. 스레드 풀 생성 (데이터보다 나중에 생성 -> 먼저 파괴됨)
+    ThreadPool pool(NUM_THREADS);
+
+    // 4. 워커 함수 정의
     auto WorkerFunc = [](void* raw) {
         auto* d = static_cast<PaddingData*>(raw);
-        for (int i = 0; i < 1000; ++i)
-            d->count++;
+        for (int i = 0; i < INCREMENTS_PER_JOB; ++i)
+        {
+            // memory_order_relaxed: 카운팅에는 충분하며 가장 빠름
+            d->count.fetch_add(1, std::memory_order_relaxed);
+        }
     };
 
-    for (int i = 0; i < NUM_THREADS * 100; ++i)
+    // 5. 작업 투입 (총 800개 작업)
+    for (int i = 0; i < NUM_THREADS * JOBS_PER_THREAD; ++i)
     {
-        // 각 작업은 자신의 인덱스에 맞는 데이터만 건드림
+        // Round-Robin 방식으로 각 데이터에 일감을 골고루 분배
         Job j{WorkerFunc, &inputs[i % NUM_THREADS]};
         pool.enqueueJob(j);
     }
 
-    // 대기 로직...
-    // 검증: 모든 inputs[i].count가 100이어야 함
+    // 6. [핵심 수정] 대기 로직 (Busy Wait)
+    // 모든 inputs의 count가 목표치에 도달할 때까지 기다림
+    bool all_finished = false;
+    while (!all_finished)
+    {
+        all_finished = true;
+        for (const auto& data : inputs)
+        {
+            // 하나라도 목표치 미만이면 아직 안 끝난 것임
+            if (data.count.load(std::memory_order_relaxed) < TARGET_COUNT)
+            {
+                all_finished = false;
+                std::this_thread::yield(); // CPU를 점유하지 않도록 양보
+                break;                     // 다시 검사 루프 처음으로
+            }
+        }
+    }
+
+    // 7. 검증
+    for (int i = 0; i < NUM_THREADS; ++i)
+    {
+        EXPECT_EQ(inputs[i].count.load(), TARGET_COUNT)
+            << "Index " << i << " 데이터 손실 발생!";
+    }
 }

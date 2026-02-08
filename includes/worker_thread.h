@@ -32,9 +32,9 @@ class WorkerThread
     std::jthread thread_;
 
     alignas(std::hardware_destructive_interference_size)
-        std::atomic<size_t> bottom_{0};
+        std::atomic<int64_t> bottom_{0};
     alignas(std::hardware_destructive_interference_size)
-        std::atomic<size_t> top_{0};
+        std::atomic<int64_t> top_{0};
 
     std::array<Job, MAX_JOB_COUNT> queue_{};
 
