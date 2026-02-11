@@ -1,5 +1,3 @@
-enable_testing()
-
 set(FETCHCONTENT_BASE_DIR ${PROJECT_SOURCE_DIR}/.dependencies)
 
 find_package(GTest)
